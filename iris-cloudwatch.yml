@@ -1,0 +1,144 @@
+AWSTemplateFormatVersion: 2010-09-09
+Metadata:
+  Author: https://github.com/IRISMeister
+  Last Updated: August 28, 2020
+  Description: Standalone IRIS with CloudWatch agent. Mostly based on https://github.com/antonum/CloudWatch-IRIS
+Description: >-
+  Based on AWS CloudFormation Sample Template EC2InstanceWithSecurityGroupSample.
+Parameters:
+  VpcIdParameter:
+    Description: Launch EC2 instances in this VPC
+    Type: AWS::EC2::VPC::Id
+  RemoteAccessCIDRParameter:
+    Description: The IP address range that can be used to SSH and access built-in Web server to the EC2 instances
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  IamInstanceProfileParameter:
+    Description: IAM instance role with CloudWatchAgentServerPolicy + s3:read
+    Type: String
+  InstanceSecurityGroupParameter:
+    Description:  Security group for the instance
+    Type: AWS::EC2::SecurityGroup::Id
+  KeyNameParameter:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+  InstanceTypeParameter:
+    Description: WebServer EC2 instance type
+    Type: String
+    Default: t2.medium
+    AllowedValues:
+      - t2.small
+      - t2.medium
+    ConstraintDescription: must be a valid EC2 instance type.
+  LatestAmiIdParameter:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  IRISKitVersionParameter:
+    Description: IRIS Kit version
+    Type: String
+    Default: 2020.1.0.215.0
+    AllowedValues:
+      - 2020.1.0.215.0
+  S3BucketNameParameter:
+    Description: S3 Bucket Name
+    Type: String
+    Default: mybucket
+Resources:
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow all hosts in this group to access each other on port 80
+      GroupName: !Sub "${AWS::StackName}-IRIS-SG"
+      VpcId: !Ref VpcIdParameter
+  SecurityGroupIngressSSH:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: TCP
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref RemoteAccessCIDRParameter
+  SecurityGroupIngressIRISWeb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: TCP
+      FromPort: 52773
+      ToPort: 52773
+      CidrIp: !Ref RemoteAccessCIDRParameter
+  EC2Instance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: !Ref InstanceTypeParameter
+      IamInstanceProfile: !Ref IamInstanceProfileParameter
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      KeyName: !Ref KeyNameParameter
+      ImageId: !Ref LatestAmiIdParameter
+      UserData:
+        Fn::Base64:
+         Fn::Sub:
+         - |
+           #!/usr/bin/env bash
+           timedatectl set-timezone "Asia/Tokyo"
+           localectl set-locale LANG=ja_JP.UTF-8
+
+           yum -y update
+
+           # setup aws cli config
+           region=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone | sed -e 's/.$//')
+           mkdir .aws
+           touch .aws/credentials  # need this only if you want to run ICM/terraform as well
+           echo "[default]" > .aws/config
+           echo "region = $region" >> .aws/config
+           cp -fR .aws /home/ec2-user/
+           chown -R ec2-user:ec2-user /home/ec2-user/.aws 
+
+           # silent install IRIS
+           wget https://raw.githubusercontent.com/IRISMeister/silent_install/master/si.sh ; chmod +x ./si.sh
+           wget https://raw.githubusercontent.com/IRISMeister/silent_install/master/manifest/Installer.cls -P manifest/
+           aws s3 cp s3://${S3BucketName}/IRIS-${IRISKitVersion}-lnxrhx64.tar.gz .
+           kit='IRIS-${IRISKitVersion}-lnxrhx64' ISC_PACKAGE_PLATFORM='lnxrhx64' ./si.sh iris /iris/sys
+           rm -fR ./manifest
+           rm -f ./IRIS-${IRISKitVersion}-lnxrhx64.tar.gz
+           rm -f ./si.sh
+           aws s3 cp s3://${S3BucketName}/iris.key /iris/sys/mgr/
+           # to activate license key
+           iris restart iris
+
+           # setup cloudwatch
+           yum install -y python3
+           yum install -y awslogs
+           pip3 install requests boto3
+           wget https://raw.githubusercontent.com/antonum/CloudWatch-IRIS/master/iris-monitor-cloudwatch.py -P /iris/sys/
+           wget https://raw.githubusercontent.com/antonum/CloudWatch-IRIS/master/intersystems-iris.conf -P /etc/awslogs/config/
+           sed -i "s/us-east-1/$region/g" /iris/sys/iris-monitor-cloudwatch.py
+           echo "*  *  *  *  * root  python3 /iris/sys/iris-monitor-cloudwatch.py" >> /etc/crontab
+
+           sed -i "s/us-east-1/$region/g" /etc/awslogs/awscli.conf
+           systemctl start awslogsd
+           systemctl enable awslogsd.service
+
+         - {
+           IRISKitVersion: !Ref IRISKitVersionParameter,
+           S3BucketName: !Ref S3BucketNameParameter
+           }
+Outputs:
+  InstanceId:
+    Description: InstanceId of the newly created EC2 instance
+    Value: !Ref EC2Instance
+  AZ:
+    Description: Availability Zone of the newly created EC2 instance
+    Value: !GetAtt 
+      - EC2Instance
+      - AvailabilityZone
+  PublicDNS:
+    Description: Public DNSName of the newly created EC2 instance
+    Value: !GetAtt 
+      - EC2Instance
+      - PublicDnsName
